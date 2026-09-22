@@ -1,7 +1,7 @@
 module.exports = {
   port: 3914,
   title: '传统木偶戏班偶头与巡演装箱API',
-  description: '维护偶头、服装配件、修补流转、巡演装箱和返场缺损追踪。',
+  description: '维护偶头、服装配件、修补流转、巡演装箱、返场缺损追踪与操控杆疲劳验收。',
   collections: {
     puppetHeads: {
       label: '偶头档案',
@@ -38,6 +38,25 @@ module.exports = {
       statuses: ['待处理', '修复中', '已补齐', '确认为遗失'],
       required: ['tourBoxId', 'itemType', 'itemName', 'problem'],
       titleFields: ['itemName', 'problem']
+    },
+    rodFatigueAcceptances: {
+      label: '操控杆疲劳验收',
+      governed: true,
+      defaultStatus: '待调',
+      statuses: ['待调', '待复核', '试演中', '准演', '失效'],
+      required: [
+        'puppetHeadId',
+        'rodId',
+        'wheelId',
+        'counterweightId',
+        'rodLengthCm',
+        'reboundSeconds',
+        'peakPullN',
+        'weightDeviationG',
+        'operatorA',
+        'operatorB'
+      ],
+      titleFields: ['puppetHeadId', 'rodId']
     }
   },
   seed: [
@@ -66,11 +85,45 @@ module.exports = {
         play: '火焰山',
         boxNo: '配件箱-02'
       }
+    },
+    {
+      // 历史验收：已因更换操控杆作废，旧测量值仍保留在归档中可查
+      collection: 'rodFatigueAcceptances',
+      id: 'rod-acc-seed-1',
+      status: '失效',
+      eventAction: '登记验收',
+      actor: '周班主',
+      note: '历史验收单（换杆后失效，旧值可查）',
+      data: {
+        puppetHeadId: 'head-seed-1',
+        rodId: 'gan-jia-02',
+        wheelId: 'lun-jia-01',
+        counterweightId: 'zhong-jia-03',
+        rodLengthCm: 62,
+        reboundSeconds: 1.2,
+        peakPullN: 28.5,
+        weightDeviationG: 20,
+        stuck: false,
+        operatorA: '陈阿福',
+        operatorB: '林小翠',
+        verdict: {
+          pass: true,
+          failures: [],
+          limits: { reboundLimitSeconds: 1.8, weightDeviationLimitGrams: 50 }
+        },
+        trialAudit: []
+      }
     }
   ],
   examples: [
     'GET /api/puppetHeads?play=火焰山&status=可演出 查询某剧目可用偶头',
     'POST /api/tourBoxes 创建巡演装箱单',
-    'POST /api/lossReports 登记返场缺损或遗失'
+    'POST /api/lossReports 登记返场缺损或遗失',
+    'POST /api/rod-fatigue/acceptances 登记操控杆疲劳验收（三件套编号+杆长/回弹/拉力+两名操纵员）',
+    'POST /api/rod-fatigue/acceptances/:id/adjust 调校登记（卡滞/回弹>1.8秒/配重偏差>50克只转待调）',
+    'POST /api/rod-fatigue/acceptances/:id/review 未参与人员复核',
+    'POST /api/rod-fatigue/acceptances/:id/trial 试演登记（两次相隔四小时达标方准登台）',
+    'GET /api/rod-fatigue/heads/:headId/history 单头验收履历（含已失效旧值）',
+    'GET /api/rod-fatigue/stage 登台状态看板'
   ]
 };
