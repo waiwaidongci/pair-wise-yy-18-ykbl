@@ -66,11 +66,32 @@ module.exports = {
         play: '火焰山',
         boxNo: '配件箱-02'
       }
+    },
+    {
+      collection: 'puppetHeads',
+      id: 'head-seed-2',
+      status: '可演出',
+      data: {
+        role: '武旦',
+        play: '白蛇传',
+        paintStatus: '完好',
+        mechanism: '开口机关顺畅',
+        accessories: ['白蛇额子'],
+        boxNo: '木箱甲-01',
+        currentUsable: true
+      },
+      note: '新排剧目备用偶头'
     }
   ],
   examples: [
     'GET /api/puppetHeads?play=火焰山&status=可演出 查询某剧目可用偶头',
     'POST /api/tourBoxes 创建巡演装箱单',
-    'POST /api/lossReports 登记返场缺损或遗失'
+    'POST /api/lossReports 登记返场缺损或遗失',
+    'POST /api/rod-inspections 登记操控杆疲劳验收（卡滞/回弹超1.8秒/配重偏差超50克只转待调）',
+    'POST /api/rod-inspections/:id/tune 调校（改杆件或配重则原验收失效另开新单）',
+    'POST /api/rod-inspections/:id/review 未参与人员复核',
+    'POST /api/rod-inspections/:id/trials 试演（两次间隔四小时达标才准登台）',
+    'GET /api/rod-inspections/by-head/:puppetHeadId/history 单头履历',
+    'GET /api/stage-status 登台状态总览'
   ]
 };

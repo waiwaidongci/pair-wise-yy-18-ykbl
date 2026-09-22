@@ -1,174 +1,13 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { execFileSync } = require('child_process');
-const { randomUUID } = require('crypto');
 const config = require('./project.config');
+const db = require('./lib/db');
+const rodStore = require('./lib/rodStore');
+const rodRoutes = require('./lib/rodRoutes');
 
 const app = express();
 const PORT = process.env.PORT || config.port;
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'app.db');
 
 app.use(express.json({ limit: '2mb' }));
-
-function sqlValue(value) {
-  if (value === null || value === undefined) return 'NULL';
-  return "'" + String(value).replaceAll("'", "''") + "'";
-}
-
-function runSql(sql) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  return execFileSync('sqlite3', [DB_FILE], {
-    input: sql,
-    encoding: 'utf8'
-  });
-}
-
-function select(sql) {
-  const output = runSql('.mode json\n' + sql);
-  if (!output.trim()) return [];
-  return JSON.parse(output);
-}
-
-function now() {
-  return new Date().toISOString();
-}
-
-function toRecord(row) {
-  const data = JSON.parse(row.data || '{}');
-  return {
-    id: row.id,
-    collection: row.collection,
-    status: row.status,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    ...data
-  };
-}
-
-function findCollection(name) {
-  const collection = config.collections[name];
-  if (!collection) {
-    const error = new Error('unknown collection: ' + name);
-    error.status = 404;
-    throw error;
-  }
-  return collection;
-}
-
-function titleFor(collectionConfig, data) {
-  return (collectionConfig.titleFields || [])
-    .map((field) => data[field])
-    .filter(Boolean)
-    .join(' / ') || data.name || data.title || data.code || '';
-}
-
-function validate(collectionConfig, data) {
-  const missing = (collectionConfig.required || []).filter((field) => data[field] === undefined || data[field] === '');
-  if (missing.length) {
-    const error = new Error('missing required fields: ' + missing.join(', '));
-    error.status = 400;
-    throw error;
-  }
-}
-
-function insertEvent({ recordId, collection, action, status, actor, note, data }) {
-  runSql(
-    'INSERT INTO events (id, record_id, collection, action, status, actor, note, data, created_at) VALUES (' +
-    [
-      sqlValue(randomUUID()),
-      sqlValue(recordId),
-      sqlValue(collection),
-      sqlValue(action || '记录'),
-      sqlValue(status || ''),
-      sqlValue(actor || ''),
-      sqlValue(note || ''),
-      sqlValue(JSON.stringify(data || {})),
-      sqlValue(now())
-    ].join(', ') +
-    ');'
-  );
-}
-
-function initDb() {
-  runSql(`
-CREATE TABLE IF NOT EXISTS records (
-  id TEXT PRIMARY KEY,
-  collection TEXT NOT NULL,
-  status TEXT NOT NULL,
-  title TEXT NOT NULL,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_records_collection ON records(collection);
-CREATE INDEX IF NOT EXISTS idx_records_status ON records(status);
-CREATE TABLE IF NOT EXISTS events (
-  id TEXT PRIMARY KEY,
-  record_id TEXT NOT NULL,
-  collection TEXT NOT NULL,
-  action TEXT NOT NULL,
-  status TEXT,
-  actor TEXT,
-  note TEXT,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_record ON events(record_id);
-`);
-
-  const count = select('SELECT COUNT(*) AS count FROM records;')[0].count;
-  if (count > 0) return;
-
-  for (const seed of config.seed || []) {
-    const collectionConfig = findCollection(seed.collection);
-    const id = seed.id || randomUUID();
-    const createdAt = seed.createdAt || now();
-    const status = seed.status || collectionConfig.defaultStatus || '';
-    const data = { ...seed.data, status };
-    runSql(
-      'INSERT INTO records (id, collection, status, title, data, created_at, updated_at) VALUES (' +
-      [
-        sqlValue(id),
-        sqlValue(seed.collection),
-        sqlValue(status),
-        sqlValue(titleFor(collectionConfig, data)),
-        sqlValue(JSON.stringify(data)),
-        sqlValue(createdAt),
-        sqlValue(seed.updatedAt || createdAt)
-      ].join(', ') +
-      ');'
-    );
-    insertEvent({
-      recordId: id,
-      collection: seed.collection,
-      action: seed.eventAction || '创建',
-      status,
-      actor: seed.actor || 'system',
-      note: seed.note || '',
-      data
-    });
-  }
-}
-
-function loadRecord(collection, id) {
-  const rows = select(
-    'SELECT * FROM records WHERE collection = ' + sqlValue(collection) + ' AND id = ' + sqlValue(id) + ' LIMIT 1;'
-  );
-  return rows[0] ? toRecord(rows[0]) : null;
-}
-
-function saveRecord(collection, id, data, status) {
-  const collectionConfig = findCollection(collection);
-  runSql(
-    'UPDATE records SET status = ' + sqlValue(status) +
-    ', title = ' + sqlValue(titleFor(collectionConfig, data)) +
-    ', data = ' + sqlValue(JSON.stringify(data)) +
-    ', updated_at = ' + sqlValue(now()) +
-    ' WHERE collection = ' + sqlValue(collection) + ' AND id = ' + sqlValue(id) + ';'
-  );
-}
 
 function applyQuery(records, query) {
   return records.filter((record) => {
@@ -186,8 +25,6 @@ function applyQuery(records, query) {
   });
 }
 
-initDb();
-
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: config.title, port: PORT });
 });
@@ -201,13 +38,22 @@ app.get('/api/meta', (req, res) => {
   });
 });
 
-app.get('/api/:collection', (req, res, next) => {
+// 操控杆疲劳验收专用入口：判定（lib/rodJudge）、归档（lib/rodStore）与入口（lib/rodRoutes）分离
+app.use('/api', rodRoutes);
+
+app.get('/api/:collection', async (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    const rows = select(
-      'SELECT * FROM records WHERE collection = ' + sqlValue(req.params.collection) + ' ORDER BY updated_at DESC;'
-    ).map(toRecord);
-    const filtered = applyQuery(rows, req.query);
+    db.findCollection(req.params.collection);
+    const rows = await db.listRecords(req.params.collection);
+    let filtered = applyQuery(rows, req.query);
+    // 偶头列表附带操控杆登台状态，与单头履历、登台状态接口同源
+    if (req.params.collection === 'puppetHeads') {
+      const map = await rodStore.stageStatusMap();
+      filtered = filtered.map((head) => ({
+        ...head,
+        rodStageReady: Boolean(map[head.id] && map[head.id].ready)
+      }));
+    }
     const limit = Number(req.query.limit || 0);
     res.json(limit > 0 ? filtered.slice(0, limit) : filtered);
   } catch (error) {
@@ -215,29 +61,16 @@ app.get('/api/:collection', (req, res, next) => {
   }
 });
 
-app.post('/api/:collection', (req, res, next) => {
+app.post('/api/:collection', async (req, res, next) => {
   try {
-    const collectionConfig = findCollection(req.params.collection);
+    const collectionConfig = db.findCollection(req.params.collection);
     const data = { ...collectionConfig.defaults, ...req.body };
     const status = data.status || collectionConfig.defaultStatus || '';
     data.status = status;
-    validate(collectionConfig, data);
-    const id = randomUUID();
-    const createdAt = now();
-    runSql(
-      'INSERT INTO records (id, collection, status, title, data, created_at, updated_at) VALUES (' +
-      [
-        sqlValue(id),
-        sqlValue(req.params.collection),
-        sqlValue(status),
-        sqlValue(titleFor(collectionConfig, data)),
-        sqlValue(JSON.stringify(data)),
-        sqlValue(createdAt),
-        sqlValue(createdAt)
-      ].join(', ') +
-      ');'
-    );
-    insertEvent({
+    db.validate(collectionConfig, data);
+    const id = db.newId();
+    await db.insertRecord({ id, collection: req.params.collection, status, data });
+    await db.insertEvent({
       recordId: id,
       collection: req.params.collection,
       action: req.body.action || '创建',
@@ -246,16 +79,16 @@ app.post('/api/:collection', (req, res, next) => {
       note: req.body.note || '',
       data
     });
-    res.status(201).json(loadRecord(req.params.collection, id));
+    res.status(201).json(await db.loadRecord(req.params.collection, id));
   } catch (error) {
     next(error);
   }
 });
 
-app.get('/api/:collection/:id', (req, res, next) => {
+app.get('/api/:collection/:id', async (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    db.findCollection(req.params.collection);
+    const record = await db.loadRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
     res.json(record);
   } catch (error) {
@@ -263,10 +96,10 @@ app.get('/api/:collection/:id', (req, res, next) => {
   }
 });
 
-app.patch('/api/:collection/:id', (req, res, next) => {
+app.patch('/api/:collection/:id', async (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    db.findCollection(req.params.collection);
+    const record = await db.loadRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
     const nextData = { ...record, ...req.body };
     delete nextData.id;
@@ -275,8 +108,8 @@ app.patch('/api/:collection/:id', (req, res, next) => {
     delete nextData.updatedAt;
     const status = nextData.status || record.status;
     nextData.status = status;
-    saveRecord(req.params.collection, req.params.id, nextData, status);
-    insertEvent({
+    await db.saveRecord(req.params.collection, req.params.id, nextData, status);
+    await db.insertEvent({
       recordId: req.params.id,
       collection: req.params.collection,
       action: req.body.action || '更新',
@@ -285,16 +118,16 @@ app.patch('/api/:collection/:id', (req, res, next) => {
       note: req.body.note || '',
       data: req.body
     });
-    res.json(loadRecord(req.params.collection, req.params.id));
+    res.json(await db.loadRecord(req.params.collection, req.params.id));
   } catch (error) {
     next(error);
   }
 });
 
-app.post('/api/:collection/:id/events', (req, res, next) => {
+app.post('/api/:collection/:id/events', async (req, res, next) => {
   try {
-    const collectionConfig = findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    const collectionConfig = db.findCollection(req.params.collection);
+    const record = await db.loadRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
     const status = req.body.status || record.status;
     if (collectionConfig.statuses && !collectionConfig.statuses.includes(status)) {
@@ -305,8 +138,8 @@ app.post('/api/:collection/:id/events', (req, res, next) => {
     delete nextData.collection;
     delete nextData.createdAt;
     delete nextData.updatedAt;
-    saveRecord(req.params.collection, req.params.id, nextData, status);
-    insertEvent({
+    await db.saveRecord(req.params.collection, req.params.id, nextData, status);
+    await db.insertEvent({
       recordId: req.params.id,
       collection: req.params.collection,
       action: req.body.action || status || '记录',
@@ -315,39 +148,28 @@ app.post('/api/:collection/:id/events', (req, res, next) => {
       note: req.body.note || '',
       data: req.body
     });
-    res.json(loadRecord(req.params.collection, req.params.id));
+    res.json(await db.loadRecord(req.params.collection, req.params.id));
   } catch (error) {
     next(error);
   }
 });
 
-app.get('/api/:collection/:id/timeline', (req, res, next) => {
+app.get('/api/:collection/:id/timeline', async (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    db.findCollection(req.params.collection);
+    const record = await db.loadRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
-    const events = select(
-      'SELECT * FROM events WHERE record_id = ' + sqlValue(req.params.id) + ' ORDER BY created_at ASC;'
-    ).map((event) => ({
-      id: event.id,
-      action: event.action,
-      status: event.status,
-      actor: event.actor,
-      note: event.note,
-      data: JSON.parse(event.data || '{}'),
-      createdAt: event.created_at
-    }));
+    const events = await db.listEvents(req.params.id);
     res.json({ record, events });
   } catch (error) {
     next(error);
   }
 });
 
-app.delete('/api/:collection/:id', (req, res, next) => {
+app.delete('/api/:collection/:id', async (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    runSql('DELETE FROM records WHERE collection = ' + sqlValue(req.params.collection) + ' AND id = ' + sqlValue(req.params.id) + ';');
-    runSql('DELETE FROM events WHERE record_id = ' + sqlValue(req.params.id) + ';');
+    db.findCollection(req.params.collection);
+    await db.deleteRecord(req.params.collection, req.params.id);
     res.status(204).end();
   } catch (error) {
     next(error);
@@ -355,9 +177,20 @@ app.delete('/api/:collection/:id', (req, res, next) => {
 });
 
 app.use((error, req, res, next) => {
-  res.status(error.status || 500).json({ error: error.message || 'server error' });
+  const body = { error: error.message || 'server error' };
+  if (error.conflicts) body.conflicts = error.conflicts;
+  res.status(error.status || 500).json(body);
 });
 
-app.listen(PORT, () => {
-  console.log(config.title + ' API running at http://localhost:' + PORT);
+async function start() {
+  await db.initDb();
+  await rodStore.init();
+  app.listen(PORT, () => {
+    console.log(config.title + ' API running at http://localhost:' + PORT);
+  });
+}
+
+start().catch((error) => {
+  console.error('启动失败:', error);
+  process.exit(1);
 });
